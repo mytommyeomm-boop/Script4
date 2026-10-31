@@ -1,0 +1,788 @@
+--[[
+    Auto Suite (Rayfield)
+    - AutoCatch
+    - Ship Speed (4 methods)
+    - Code Redeemer (scan map + batch)
+    - Status
+    
+    Keybind: F = AutoCatch toggle
+]]
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players           = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+local RunService        = game:GetService("RunService")
+local LocalPlayer       = Players.LocalPlayer
+
+-- ============================================================
+-- RAYFIELD
+-- ============================================================
+local Rayfield
+do
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+    end)
+    if not ok or not res then warn("[Suite] โหลด Rayfield ไม่ได้: "..tostring(res)) return end
+    Rayfield = res
+end
+
+-- ============================================================
+-- SHARED CONFIG
+-- ============================================================
+local Shared = ReplicatedStorage:WaitForChild("Shared", 15)
+if not Shared then Rayfield:Notify({Title="Suite",Content="โหลด Shared ไม่ได้",Duration=5}) return end
+
+local Config       = Shared:WaitForChild("Config", 10)
+local Creatures    = require(Config:WaitForChild("Creatures"))
+local CatchShot    = require(Config:WaitForChild("CatchShot"))
+local CatchVisual  = require(Config:WaitForChild("CatchVisual"))
+local CreatureRide = require(Config:WaitForChild("CreatureRide"))
+local PlayerShip   = require(Config:WaitForChild("PlayerShip"))
+local Net          = require(Shared:WaitForChild("Net"))
+
+local Control   = CatchVisual.Control
+local Throw     = CatchShot.Throw
+local TierOrder = CatchShot.TierOrder or {"iron","heavy","spread","rainbow"}
+
+local RemotesFolder = ReplicatedStorage:WaitForChild(Net.FolderName, 15)
+local CatchThrowRemote = RemotesFolder and RemotesFolder:WaitForChild(Net.CatchThrow, 15)
+
+-- ============================================================
+-- GLOBAL STATE
+-- ============================================================
+local stats = { caught = 0, failed = 0, blocked = 0, lastReason = "-", codesTried = 0, codesOK = 0 }
+
+-- ============================================================
+-- ============ AUTO CATCH ============
+-- ============================================================
+local catchState = {
+    running = false, lastThrow = 0, history = {},
+    settings = {
+        Interval = math.max((Throw.ThrowsPerMinute and 60/Throw.ThrowsPerMinute) or 0.6, 0.25),
+        MaxAngle = Control.AssistMaxAngleDegrees or 45,
+        MaxRange = Throw.MaxRangeStuds or 200,
+        PreferTier = "auto", SkipHeld = true, AutoEnable = true,
+    },
+}
+local function log(m) print("[Suite] "..m) end
+
+local function readBag()
+    local c = {}; for _,t in TierOrder do c[t]=0 end
+    local s = LocalPlayer:GetAttribute("CatchBalls")
+    if type(s)~="string" then return c end
+    local i=1
+    for n in string.gmatch(s,"[^,]+") do
+        if TierOrder[i] then c[TierOrder[i]]=tonumber(n) or 0 end
+        i+=1
+    end
+    return c
+end
+
+local function pickTier(c)
+    if catchState.settings.PreferTier~="auto" and (c[catchState.settings.PreferTier] or 0)>0 then
+        return catchState.settings.PreferTier
+    end
+    for i=#TierOrder,1,-1 do if (c[TierOrder[i]] or 0)>0 then return TierOrder[i] end end
+    return nil
+end
+
+local function catchPlayerReady()
+    if LocalPlayer:GetAttribute("CatchOn")~=true then
+        if catchState.settings.AutoEnable then
+            pcall(function() LocalPlayer:SetAttribute("CatchOn",true) end)
+        end
+        if LocalPlayer:GetAttribute("CatchOn")~=true then return false,"โหมดจับปิด" end
+    end
+    if LocalPlayer:GetAttribute(CreatureRide.RiderAttribute)==true then return false,"ขี่สัตว์" end
+    if LocalPlayer:GetAttribute("IslandVisitState")~=nil then return false,"เยี่ยมเกาะ" end
+    local ch=LocalPlayer.Character
+    local h=ch and ch:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health<=0 then return false,"ตาย" end
+    if not ch:FindFirstChild("HumanoidRootPart") then return false,"ไม่มี RootPart" end
+    return true
+end
+
+local function catchable(m)
+    if not m:IsA("Model") or not m.PrimaryPart then return false end
+    if not m:IsDescendantOf(Workspace) then return false end
+    if m:GetAttribute("CatchGhost")==true then return false end
+    if m:GetAttribute("RoundHidden")==true then return false end
+    if type(m:GetAttribute("SlotId"))~="string" then return false end
+    local now=Workspace:GetServerTimeNow()
+    if catchState.settings.SkipHeld then
+        local h=m:GetAttribute("CatchHeldUntil")
+        if type(h)=="number" and now<h then return false end
+    end
+    local st=m:GetAttribute("BossStunUntil")
+    if type(st)=="number" and now<st then return false end
+    return true
+end
+
+local function findCatchTarget(cam,myPos)
+    local camP=cam.CFrame.Position
+    local look=cam.CFrame.LookVector
+    local best,bs=nil,math.huge
+    for _,m in CollectionService:GetTagged(Creatures.CreatureTag) do
+        if not catchable(m) then continue end
+        local pos=m:GetPivot().Position
+        local d=(pos-myPos).Magnitude
+        if d>catchState.settings.MaxRange then continue end
+        local u=(pos-camP).Unit
+        local a=math.deg(math.acos(math.clamp(look:Dot(u),-1,1)))
+        if a>catchState.settings.MaxAngle then continue end
+        local s=a*1.5+d*0.05
+        if s<bs then bs,best=s,m end
+    end
+    return best
+end
+
+local function catchRateOk()
+    local now=os.clock()
+    if Control.ClientMinGapSeconds and #catchState.history>0
+        and now-catchState.history[#catchState.history]<Control.ClientMinGapSeconds then return false end
+    while #catchState.history>0 and now-catchState.history[1]>60 do table.remove(catchState.history,1) end
+    if Throw.ThrowsPerMinute and #catchState.history>=Throw.ThrowsPerMinute then return false end
+    return true
+end
+
+local function fireCatch(target,tier)
+    if not CatchThrowRemote then return false end
+    local ok=pcall(function()
+        CatchThrowRemote:FireServer({tier=tier,target=target:GetAttribute("SlotId"),aim=target:GetPivot().Position})
+    end)
+    if ok then stats.caught+=1; table.insert(catchState.history,os.clock()); return true end
+    stats.failed+=1; return false
+end
+
+local function catchLoop()
+    log("AutoCatch: เริ่ม")
+    while catchState.running do
+        task.wait(0.05)
+        local ready,reason=catchPlayerReady()
+        if not ready then stats.lastReason=reason; continue end
+        if os.clock()-catchState.lastThrow<catchState.settings.Interval then continue end
+        if not catchRateOk() then stats.lastReason="rate limit"; stats.blocked+=1; continue end
+        local tier=pickTier(readBag())
+        if not tier then stats.lastReason="ไม่มีลูกบอล"; continue end
+        local cam=Workspace.CurrentCamera
+        local ch=LocalPlayer.Character
+        local rt=ch and ch:FindFirstChild("HumanoidRootPart")
+        if not cam or not rt then continue end
+        local t=findCatchTarget(cam,rt.Position)
+        if not t then stats.lastReason="ไม่เจอเป้า"; continue end
+        if fireCatch(t,tier) then catchState.lastThrow=os.clock(); stats.lastReason="ยิง" end
+    end
+    log("AutoCatch: หยุด")
+end
+
+-- ============================================================
+-- ============ SHIP SPEED ============
+-- ============================================================
+local shipState = {
+    enabled = false,
+    multiplier = 2,
+    method = "BodyVelocity",  -- BodyVelocity | Attribute | CFrame | InputSpam
+    ship = nil,
+    bv = nil,
+    shipRemote = nil,
+    lastSpam = 0,
+    detectedMethods = {},
+}
+
+-- หาเรือของผู้เล่น
+local function findOwnShip()
+    for _,m in Workspace:GetChildren() do
+        if m:IsA("Model")
+           and m:GetAttribute("PlayerShip")==true
+           and m:GetAttribute("ShipOwner")==LocalPlayer.UserId then
+            return m
+        end
+    end
+    return nil
+end
+
+-- หา remote ที่น่าจะเป็น ShipControls
+local function findShipRemote()
+    if shipState.shipRemote then return shipState.shipRemote end
+    if not RemotesFolder then return nil end
+    local names = {"ShipControls","ShipAct","ShipHelm","ShipMove","ShipInput","HelmAct","SteerAct"}
+    for _,n in names do
+        local r = RemotesFolder:FindFirstChild(n)
+        if r and (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then
+            shipState.shipRemote = r; return r
+        end
+    end
+    -- scan
+    for _,r in RemotesFolder:GetChildren() do
+        if not (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then continue end
+        local l = string.lower(r.Name)
+        if string.find(l,"ship") or string.find(l,"helm") or string.find(l,"steer") then
+            shipState.shipRemote = r; return r
+        end
+    end
+    return nil
+end
+
+-- Method 1: BodyVelocity (visual boost)
+local function applyBodyVelocity(ship)
+    local pp = ship.PrimaryPart or ship:FindFirstChildWhichIsA("BasePart",true)
+    if not pp then return end
+    local bv = shipState.bv
+    if not bv or bv.Parent ~= pp then
+        if bv then bv:Destroy() end
+        bv = Instance.new("BodyVelocity")
+        bv.Name = "_SpeedHack"
+        bv.MaxForce = Vector3.new(math.huge,0,math.huge)
+        bv.Parent = pp
+        shipState.bv = bv
+    end
+    local speed = ship:GetAttribute("ShipSpeed") or 0
+    if math.abs(speed) < 0.1 then
+        bv.Velocity = Vector3.zero
+        return
+    end
+    -- ทิศทาง: ship heading ใช้ sin/cos, เทียบได้กับ LookVector (Y=0)
+    local look = pp.CFrame.LookVector
+    local flat = Vector3.new(look.X,0,look.Z)
+    if flat.Magnitude < 0.001 then flat = Vector3.new(0,0,-1) end
+    flat = flat.Unit
+    bv.Velocity = flat * speed * (shipState.multiplier - 1)
+end
+
+-- Method 2: Attribute (ลองเขียน attribute)
+local function applyAttribute(ship)
+    -- ShipSpeed เป็น server-set, แต่ลอง mult attributes อื่น
+    pcall(function()
+        ship:SetAttribute("ShipSpeedMultiplier", shipState.multiplier)
+        ship:SetAttribute("_ClientSpeedMult", shipState.multiplier)
+        ship:SetAttribute("SpeedBoost", shipState.multiplier)
+    end)
+end
+
+-- Method 3: CFrame Pivot (visual ล้วน)
+local function applyCFrame(ship,dt)
+    local speed = ship:GetAttribute("ShipSpeed") or 0
+    if math.abs(speed) < 0.1 then return end
+    local pv = ship:GetPivot()
+    local look = pv.LookVector
+    local flat = Vector3.new(look.X,0,look.Z)
+    if flat.Magnitude < 0.001 then return end
+    flat = flat.Unit
+    local boost = speed * (shipState.multiplier - 1) * dt
+    ship:PivotTo(pv + flat * boost)
+end
+
+-- Method 4: Input Spam (ยิง helm remote ถี่)
+local function applyInputSpam(ship,now)
+    if now - shipState.lastSpam < 0.05 then return end
+    shipState.lastSpam = now
+    local r = findShipRemote()
+    if not r then return end
+    local level = ship:GetAttribute("ShipLevel") or 1
+    local maxSpeed = PlayerShip.SpeedStudsPerSecond[level] or 30
+    -- พยายามส่ง helm แบบเต็มกำลัง
+    local payloads = {
+        {helm={throttle=1,steer=0}},
+        {throttle=1,steer=0},
+        {input={throttle=1,steer=0}},
+        {x=0,z=1},
+    }
+    for _,p in payloads do
+        pcall(function()
+            if r:IsA("RemoteEvent") then r:FireServer(p) else r:InvokeServer(p) end
+        end)
+    end
+end
+
+-- ============================================================
+-- ============ CODE REDEEMER ============
+-- ============================================================
+local codeState = {
+    remote = nil,
+    cooldown = 1.5,
+    lastFire = 0,
+    results = {},  -- {code, status, response}
+    presets = {
+        "WELCOME","LAUNCH","BETA","THANKYOU","PETS","ISLAND",
+        "PIRATE","UPDATE","NEWYEAR","100K","1M","FREEBALL",
+        "SEASON","LUCKY","CREW","BOAT","GIFT","FREE","ENJOY",
+        "FISHING","PETGAME","THAILAND","SIAM","CREATURE",
+    },
+}
+
+-- หา redeem remote
+local function findRedeemRemote()
+    if codeState.remote then return codeState.remote end
+    if not RemotesFolder then return nil end
+    local names = {
+        "RedeemAct","RedeemQuery","CodeAct","CodeRedeem","RedeemCode",
+        Net.SettingsAct,
+        (type(Net.RedeemAct)=="string" and Net.RedeemAct or nil),
+    }
+    for _,n in names do
+        if type(n)=="string" then
+            local r = RemotesFolder:FindFirstChild(n)
+            if r and (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then
+                codeState.remote = r; return r
+            end
+        end
+    end
+    for _,r in RemotesFolder:GetChildren() do
+        if not (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then continue end
+        local l = string.lower(r.Name)
+        if string.find(l,"redeem") or string.find(l,"code") or string.find(l,"gift") then
+            codeState.remote = r; return r
+        end
+    end
+    return nil
+end
+
+-- สแกนหา code ในแมพ
+local function scanMapCodes()
+    local found, seen = {}, {}
+    local function add(c)
+        if type(c)=="string" and #c>=3 and #c<=40 and not seen[c] then
+            seen[c]=true; table.insert(found,c)
+        end
+    end
+    local function scan(root)
+        if not root then return end
+        for _,o in root:GetDescendants() do
+            if o:IsA("StringValue") and o.Value~="" then
+                local n = string.lower(o.Name)
+                if string.find(n,"code") or string.find(n,"redeem") then add(o.Value) end
+            elseif o:IsA("BasePart") and o:GetAttribute("IsCode")==true then
+                add(o:GetAttribute("Code") or o.Name)
+            elseif o:IsA("TextLabel") and o:GetAttribute("IsCode")==true then
+                add(o.Text)
+            elseif o:IsA("Model") and o:GetAttribute("IsCode")==true then
+                add(o:GetAttribute("Code") or o.Name)
+            end
+        end
+    end
+    scan(Workspace)
+    scan(ReplicatedStorage)
+    return found
+end
+
+-- redeem 1 code (ลองหลาย payload)
+local function redeemCode(code)
+    local r = findRedeemRemote()
+    if not r then return false,"ไม่พบ remote" end
+    local payloads = {
+        {code=code},
+        {Code=code},
+        {codeText=code},
+        {kind="code",code=code},
+        {Action="code",code=code},
+        {action="redeem",code=code},
+        {code=code,quiet=true},
+    }
+    for _,p in payloads do
+        local ok,res
+        if r:IsA("RemoteFunction") then
+            ok,res = pcall(function() return r:InvokeServer(p) end)
+        else
+            ok,res = pcall(function() r:FireServer(p) end)
+            if ok then res = "sent" end
+        end
+        if ok and res~=nil then
+            local success = false
+            if type(res)=="boolean" then success=res
+            elseif type(res)=="table" then success = res.ok==true or res.success==true
+            elseif type(res)=="string" then success = res~="" and res~="false" end
+            if success then
+                return true, tostring(res)
+            end
+        end
+    end
+    return false,"ล้มเหลว"
+end
+
+-- batch redeem
+local function redeemBatch(list, progressCb)
+    codeState.results = {}
+    for i,code in list do
+        -- cooldown
+        local wait = codeState.cooldown - (os.clock() - codeState.lastFire)
+        if wait > 0 then task.wait(wait) end
+        codeState.lastFire = os.clock()
+        stats.codesTried += 1
+        local ok,resp = redeemCode(code)
+        if ok then stats.codesOK += 1 end
+        table.insert(codeState.results, {code=code, ok=ok, resp=resp})
+        if progressCb then progressCb(i,#list,code,ok,resp) end
+    end
+end
+
+-- ============================================================
+-- RAYFIELD UI
+-- ============================================================
+local Window = Rayfield:CreateWindow({
+    Name = "Suite",
+    LoadingTitle = "Suite",
+    LoadingSubtitle = "Auto + Ship + Codes",
+    ConfigurationSaving = { Enabled = true, FolderName = "Suite", FileName = "Config" },
+    KeySystem = false,
+})
+
+-- ---------- TAB: AUTO CATCH ----------
+local tabCatch = Window:CreateTab("Auto Catch", 4483362458)
+tabCatch:CreateSection("การทำงาน")
+
+local catchToggle
+catchToggle = tabCatch:CreateToggle({
+    Name = "Auto Catch (F)",
+    CurrentValue = false,
+    Flag = "AutoCatchToggle",
+    Callback = function(v)
+        if v then
+            if not catchState.running then
+                catchState.running = true
+                task.spawn(catchLoop)
+            end
+            Rayfield:Notify({Title="AutoCatch",Content="ON",Duration=2})
+        else
+            catchState.running = false
+            Rayfield:Notify({Title="AutoCatch",Content="OFF",Duration=2})
+        end
+    end,
+})
+
+tabCatch:CreateSlider({Name="Interval (s)",Range={0.25,3},Increment=0.05,Suffix="s",
+    CurrentValue=catchState.settings.Interval,Flag="CatchInterval",
+    Callback=function(v) catchState.settings.Interval=v end})
+
+tabCatch:CreateSlider({Name="Max Angle (°)",Range={5,180},Increment=5,Suffix="°",
+    CurrentValue=catchState.settings.MaxAngle,Flag="CatchAngle",
+    Callback=function(v) catchState.settings.MaxAngle=v end})
+
+tabCatch:CreateSlider({Name="Max Range (studs)",Range={20,500},Increment=10,Suffix=" studs",
+    CurrentValue=catchState.settings.MaxRange,Flag="CatchRange",
+    Callback=function(v) catchState.settings.MaxRange=v end})
+
+tabCatch:CreateDropdown({Name="Preferred Tier",Options={"auto","rainbow","spread","heavy","iron"},
+    CurrentOption={"auto"},Flag="CatchTier",
+    Callback=function(o) catchState.settings.PreferTier=(type(o)=="table") and o[1] or o end})
+
+tabCatch:CreateToggle({Name="Skip Held",CurrentValue=true,Flag="CatchSkipHeld",
+    Callback=function(v) catchState.settings.SkipHeld=v end})
+
+tabCatch:CreateToggle({Name="Auto Enable Catch Mode",CurrentValue=true,Flag="CatchAutoEnable",
+    Callback=function(v) catchState.settings.AutoEnable=v end})
+
+-- ---------- TAB: SHIP SPEED ----------
+local tabShip = Window:CreateTab("Ship Speed", 4483362458)
+tabShip:CreateSection("การทำงาน")
+
+local shipStatusLabel
+
+local function updateShipStatus()
+    if not shipStatusLabel then return end
+    local ship = shipState.ship or findOwnShip()
+    if not ship then
+        pcall(function() shipStatusLabel:Set({Title="Status",Content="🚫 ไม่พบเรือ (ยังไม่ขึ้นเรือ?)"}) end)
+        return
+    end
+    local lvl = ship:GetAttribute("ShipLevel") or "?"
+    local spd = ship:GetAttribute("ShipSpeed") or 0
+    local st  = ship:GetAttribute("ShipState") or "?"
+    local pp  = ship.PrimaryPart or ship:FindFirstChildWhichIsA("BasePart",true)
+    local bv  = pp and pp:FindFirstChild("_SpeedHack")
+    pcall(function()
+        shipStatusLabel:Set({
+            Title="Status",
+            Content = string.format(
+                "🚢 %s\nLevel: %s  State: %s\nSpeed: %.1f  Multiplier: x%.2f\nMethod: %s  BV: %s",
+                ship.Name, tostring(lvl), tostring(st), spd, shipState.multiplier,
+                shipState.method, bv and "✅" or "—"
+            ),
+        })
+    end)
+end
+
+tabShip:CreateToggle({
+    Name = "Enable Ship Speed",
+    CurrentValue = false,
+    Flag = "ShipSpeedToggle",
+    Callback = function(v)
+        shipState.enabled = v
+        if not v then
+            if shipState.bv then shipState.bv:Destroy(); shipState.bv = nil end
+        end
+        Rayfield:Notify({Title="ShipSpeed",Content=v and "ON" or "OFF",Duration=2})
+    end,
+})
+
+tabShip:CreateSlider({
+    Name = "Speed Multiplier",
+    Range = { 1.0, 10.0 },
+    Increment = 0.25,
+    Suffix = "x",
+    CurrentValue = shipState.multiplier,
+    Flag = "ShipMult",
+    Callback = function(v) shipState.multiplier = v end,
+})
+
+tabShip:CreateDropdown({
+    Name = "Method",
+    Options = { "BodyVelocity", "Attribute", "CFrame", "InputSpam" },
+    CurrentOption = { "BodyVelocity" },
+    Flag = "ShipMethod",
+    Callback = function(o)
+        shipState.method = (type(o)=="table") and o[1] or o
+        if shipState.bv then shipState.bv:Destroy(); shipState.bv = nil end
+        log("Ship method = "..shipState.method)
+    end,
+})
+
+tabShip:CreateButton({
+    Name = "🔍 ตรวจจับเรือ / Remotes",
+    Callback = function()
+        local ship = findOwnShip()
+        local rem  = findShipRemote()
+        local lines = {}
+        table.insert(lines, "Ship: "..(ship and ship.Name or "ไม่พบ"))
+        table.insert(lines, "ShipRemote: "..(rem and (rem.Name.." ["..rem.ClassName.."]") or "ไม่พบ"))
+        if RemotesFolder then
+            local scan = {"Remotes ที่เกี่ยวกับ ship/helm:"}
+            for _,r in RemotesFolder:GetChildren() do
+                local l = string.lower(r.Name)
+                if string.find(l,"ship") or string.find(l,"helm") or string.find(l,"steer") then
+                    table.insert(scan, "  • "..r.Name)
+                end
+            end
+            table.insert(lines, table.concat(scan,"\n"))
+        end
+        Rayfield:Notify({Title="ShipSpeed",Content=table.concat(lines,"\n"),Duration=8})
+    end,
+})
+
+shipStatusLabel = tabShip:CreateParagraph({ Title="Status", Content="กำลังสแกน..." })
+
+-- Loop สำหรับ ship speed
+RunService.Heartbeat:Connect(function(dt)
+    if not shipState.enabled then return end
+    local ship = findOwnShip()
+    shipState.ship = ship
+    if not ship then return end
+    if shipState.method == "BodyVelocity" then
+        applyBodyVelocity(ship)
+    elseif shipState.method == "Attribute" then
+        applyAttribute(ship)
+    elseif shipState.method == "CFrame" then
+        applyCFrame(ship, dt)
+    elseif shipState.method == "InputSpam" then
+        applyInputSpam(ship, os.clock())
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        updateShipStatus()
+    end
+end)
+
+-- ---------- TAB: CODES ----------
+local tabCodes = Window:CreateTab("Codes", 4483362458)
+tabCodes:CreateSection("Redeem")
+
+local manualCodeBox
+tabCodes:CreateInput({
+    Name = "Code (Manual)",
+    PlaceholderText = "พิมพ์ code แล้วกด Redeem",
+    RemoveTextAfterFocusLost = false,
+    Flag = "CodeInput",
+    Callback = function(t) manualCodeBox = t end,
+})
+
+tabCodes:CreateButton({
+    Name = "Redeem Code นี้",
+    Callback = function()
+        if not manualCodeBox or manualCodeBox=="" then
+            Rayfield:Notify({Title="Code",Content="ยังไม่ได้พิมพ์ code",Duration=3}); return
+        end
+        local ok,resp = redeemCode(manualCodeBox)
+        Rayfield:Notify({
+            Title="Code: "..manualCodeBox,
+            Content=(ok and "✅ " or "❌ ")..tostring(resp),
+            Duration=6,
+        })
+    end,
+})
+
+tabCodes:CreateSlider({
+    Name = "Cooldown (s)",
+    Range = { 0.5, 5 },
+    Increment = 0.25,
+    Suffix = "s",
+    CurrentValue = codeState.cooldown,
+    Flag = "CodeCooldown",
+    Callback = function(v) codeState.cooldown = v end,
+})
+
+tabCodes:CreateSection("Batch")
+
+local batchBox
+tabCodes:CreateInput({
+    Name = "Batch List (คั่นด้วย , หรือขึ้นบรรทัดใหม่)",
+    PlaceholderText = "WELCOME,LAUNCH,BETA",
+    RemoveTextAfterFocusLost = false,
+    Flag = "BatchInput",
+    Callback = function(t) batchBox = t end,
+})
+
+local batchProgress
+tabCodes:CreateButton({
+    Name = "▶ Redeem Batch",
+    Callback = function()
+        if not batchBox or batchBox=="" then
+            Rayfield:Notify({Title="Code",Content="ยังไม่มี batch",Duration=3}); return
+        end
+        local list = {}
+        for c in string.gmatch(batchBox, "[^,%s]+") do
+            if #c>=2 then table.insert(list,string.upper(c)) end
+        end
+        if #list==0 then return end
+        Rayfield:Notify({Title="Code",Content="เริ่ม redeem "..#list.." code",Duration=3})
+        task.spawn(function()
+            redeemBatch(list, function(i,total,code,ok,resp)
+                if batchProgress then
+                    pcall(function()
+                        batchProgress:Set({
+                            Title = "Progress "..i.."/"..total,
+                            Content = string.format("%s %s\n%s",
+                                ok and "✅" or "❌", code, tostring(resp))
+                        })
+                    end)
+                end
+            end)
+            Rayfield:Notify({Title="Code",Content=("เสร็จ: %d ผ่าน, %d ล้มเหลว")
+                :format(stats.codesOK, stats.codesTried-stats.codesOK),Duration=6})
+        end)
+    end,
+})
+
+tabCodes:CreateButton({
+    Name = "📋 ใช้ Preset List",
+    Callback = function()
+        batchBox = table.concat(codeState.presets, ",")
+        Rayfield:Notify({Title="Code",Content="โหลด "..#codeState.presets.." preset (กด Redeem Batch เพื่อเริ่ม)",Duration=4})
+    end,
+})
+
+tabCodes:CreateButton({
+    Name = "🔍 สแกน Code ในแมพ",
+    Callback = function()
+        local found = scanMapCodes()
+        if #found==0 then
+            Rayfield:Notify({Title="Scan",Content="ไม่พบ code ในแมพ",Duration=4}); return
+        end
+        batchBox = table.concat(found, ",")
+        Rayfield:Notify({Title="Scan",Content="พบ "..#found.." code (โหลดเข้า Batch แล้ว)",Duration=4})
+    end,
+})
+
+tabCodes:CreateSection("Remote")
+
+tabCodes:CreateButton({
+    Name = "แสดง Redeem Remote ที่ตรวจพบ",
+    Callback = function()
+        local r = findRedeemRemote()
+        if r then
+            Rayfield:Notify({Title="Code Remote",Content=r.Name.." ["..r.ClassName.."]",Duration=6})
+        else
+            Rayfield:Notify({Title="Code Remote",Content="ไม่พบ remote ที่ตรง",Duration=6})
+        end
+    end,
+})
+
+batchProgress = tabCodes:CreateParagraph({Title="Progress",Content="-"})
+
+-- ---------- TAB: STATUS ----------
+local tabStatus = Window:CreateTab("Status", 4483362458)
+
+local statusCatch = tabStatus:CreateParagraph({Title="AutoCatch",Content="-"})
+local statusBag   = tabStatus:CreateParagraph({Title="Bag",Content="-"})
+local statusShip  = tabStatus:CreateParagraph({Title="Ship",Content="-"})
+local statusCodes = tabStatus:CreateParagraph({Title="Codes",Content="-"})
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        local cReady,cReason = catchPlayerReady()
+        pcall(function()
+            statusCatch:Set({Title="AutoCatch",Content=string.format(
+                "%s\n%s\nReason: %s\nThrown:%d Blocked:%d Fail:%d",
+                catchState.running and "🟢 RUNNING" or "🔴 STOPPED",
+                cReady and "✅ Ready" or ("⏸ "..tostring(cReason)),
+                stats.lastReason, stats.caught, stats.blocked, stats.failed)})
+        end)
+        local b = readBag()
+        local bl = {}
+        for _,t in TierOrder do table.insert(bl, string.format("  • %-8s : %d", t, b[t] or 0)) end
+        pcall(function() statusBag:Set({Title="Bag",Content=table.concat(bl,"\n")}) end)
+        local sh = shipState.ship
+        pcall(function()
+            statusShip:Set({Title="Ship",Content=string.format(
+                "%s | Method: %s | x%.2f",
+                sh and sh.Name or "—", shipState.method,
+                shipState.enabled and shipState.multiplier or 1)})
+        end)
+        pcall(function()
+            statusCodes:Set({Title="Codes",Content=string.format(
+                "Tried: %d  OK: %d\nRemote: %s",
+                stats.codesTried, stats.codesOK,
+                (codeState.remote and codeState.remote.Name) or "ยังไม่พบ")})
+        end)
+    end
+end)
+
+-- ============================================================
+-- KEYBIND
+-- ============================================================
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.F then
+        local v = not catchState.running
+        if v then
+            catchState.running = true
+            task.spawn(catchLoop)
+        else
+            catchState.running = false
+        end
+        Rayfield:Notify({Title="AutoCatch",Content=v and "ON" or "OFF",Duration=2})
+    end
+end)
+
+-- ============================================================
+-- EXPORT API
+-- ============================================================
+_G.Suite = {
+    autoCatch = {
+        start = function() if not catchState.running then catchState.running=true; task.spawn(catchLoop) end end,
+        stop  = function() catchState.running=false end,
+        toggle= function() if catchState.running then catchState.running=false else catchState.running=true; task.spawn(catchLoop) end end,
+    },
+    ship = {
+        enable  = function(v) shipState.enabled = v ~= false end,
+        setMult = function(x) shipState.multiplier = math.max(1,x) end,
+        method  = function(m) shipState.method = m end,
+    },
+    codes = {
+        redeem = redeemCode,
+        batch  = redeemBatch,
+        scan   = scanMapCodes,
+        find   = findRedeemRemote,
+    },
+    stats = stats,
+}
+
+log("โหลดเสร็จ — Rayfield UI พร้อมใช้งาน")
+Rayfield:Notify({Title="Suite",Content="พร้อมใช้งาน (F = AutoCatch)",Duration=5})
