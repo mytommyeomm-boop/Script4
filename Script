@@ -1,712 +1,375 @@
 --[[ ============================================================
-    AUTO DODGE + GUI CONTROL
+    AUTO DODGE GUI V2 — FIXED TOGGLE + AUTO RECOVER
     ------------------------------------------------------------
-    • GUI ปุ่มลอย (ลากได้, PC/Mobile/Gamepad)
-    • เปิด/ปิดด้วยการคลิก 1 ครั้ง
-    • Settings panel: Margin / Cooldown / Direction / AntiFeint
-    • ใช้ _G.AutoDodge.* สำหรับคำสั่งจาก console ได้
+    • Long-press ถูก cancel ถูกต้อง (ไม่ double-toggle)
+    • Auto-recover ถ้า GUI หาย
+    • Hotkey fallback (F1)
+    • Reference HUD ตรง ไม่พึ่ง GetChildren order
     ============================================================ ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace         = game:GetService("Workspace")
-local RunService        = game:GetService("RunService")
-local Players           = game:GetService("Players")
-local UserInputService  = game:GetService("UserInputService")
-local TweenService      = game:GetService("TweenService")
-local GuiService        = game:GetService("GuiService")
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Workspace        = game:GetService("Workspace")
 
-local LP         = Players.LocalPlayer
-local ForceDash  = ReplicatedStorage:WaitForChild("Events"):WaitForChild("ForceDash")
-local Styles     = require(ReplicatedStorage.Modules:WaitForChild("Styles"))
-
--- ==========================================================
---  PART 1: AUTO DODGE CORE
--- ==========================================================
-
-local CONFIG = {
-    Enabled             = false,     -- เริ่มที่ OFF
-    Margin              = 0.02,
-    MinCooldown         = 0.06,
-    StrictSide          = true,
-    OnlyWhenTargeted    = true,
-    AntiFeint           = true,
-    LatencyCompensation = true,
-    ManualPingOffset    = nil,
-    Debug               = false,
-}
-
-local lastDodgeTime = 0
-local opponent      = nil
-local conns         = {}
-local alternateSide = "Left"
-local activePunch   = {
-    id = 0, startTime = 0, hitTime = 0,
-    cancelled = false, dashed = false,
-    isHeavy = false, startup = 0.2,
-}
-
-local function log(...)
-    if CONFIG.Debug then print("[Dodge]", ...) end
-end
-
-local function getState(n)
-    local s = Workspace:FindFirstChild("States")
-    return s and s:FindFirstChild(n)
-end
-local function getMyCD()  local s = getState(LP.Name); return s and s:FindFirstChild("CharacterData") end
-local function getMyOcc() local s = getState(LP.Name); return s and s:FindFirstChild("Occupied") end
-
-local function canDash()
-    local c = LP.Character
-    if not (c and c.PrimaryPart) then return false end
-    local o = getMyOcc(); if not o then return false end
-    if o.Dashing.Value then return false end
-    local d = getMyCD(); if not d then return false end
-    if d.Stunned.Value or d.Cutscene.Value then return false end
-    if d.Stamina.Value <= 1 then return false end
-    if c:GetAttribute("RiceballChanneling") then return false end
-    if c:GetAttribute("NoDash") then return false end
-    return true
-end
-
-local function getNeededDirection()
-    local c = LP.Character; if not c then return nil end
-    local dir = c:GetAttribute("NeededDirection")
-    if dir == "Left" or dir == "Right" or dir == "Forward" or dir == "Backward" then
-        return dir
-    end
-    return nil
-end
-
-local function computeSideDirection()
-    local c = LP.Character
-    if not (c and c.PrimaryPart) then return alternateSide end
-    local o = getMyOcc()
-    local locked = o and o.LockedOn.Value
-    if locked and locked.PrimaryPart then
-        local away = (c.PrimaryPart.Position - locked.PrimaryPart.Position) * Vector3.new(1,0,1)
-        if away.Magnitude > 0.1 then
-            away = away.Unit
-            local side = Vector3.new(away.Z, 0, -away.X)
-            local look = c.PrimaryPart.CFrame.LookVector * Vector3.new(1,0,1)
-            if look.Magnitude > 0.1 then
-                return side:Dot(look.Unit) > 0 and "Right" or "Left"
-            end
-        end
-    end
-    return alternateSide
-end
-
-local function isOppFeinting(opp)
-    if not opp then return false end
-    return opp:GetAttribute("IsFeinting") == true
-        or opp:GetAttribute("LocalIsFeinting") == true
-end
-
-local function isOppPunching(opp)
-    if not opp then return false end
-    if opp:GetAttribute("Punching") == true then return true end
-    if opp:GetAttribute("IsHeavy") == true then return true end
-    local os = getState(opp.Name)
-    local occ = os and os:FindFirstChild("Occupied")
-    local p = occ and occ:FindFirstChild("Punching")
-    return p and p.Value or false
-end
-
-local function getStartup(opp, heavy)
-    local os = getState(opp.Name); if not os then return 0.2 end
-    local pd = os:FindFirstChild("PlayerData")
-    local occ = os:FindFirstChild("Occupied")
-    if not (pd and occ) then return 0.2 end
-    local sv = pd:FindFirstChild("Style"); if not sv then return 0.2 end
-    local style = Styles[sv.Value]; if not style then return 0.2 end
-    local info
-    if heavy then
-        info = style.HeavyAttacks and style.HeavyAttacks.DefaultPunchInfo
-    else
-        local cid = 1
-        local cc = occ:FindFirstChild("CurrentCombo")
-        if cc then cid = cc.Value end
-        local combo = style.Combos[cid]
-        info = combo and combo.DefaultPunchInfo
-    end
-    if not info then info = style.DefaultPunchInfo end
-    return (info and info.Startup) or 0.2
-end
-
-local function doDodge(dir)
-    if not canDash() then return false end
-    local now = Workspace:GetServerTimeNow()
-    if now - lastDodgeTime < CONFIG.MinCooldown then return false end
-    lastDodgeTime = now
-    if dir == "Left" then alternateSide = "Right"
-    elseif dir == "Right" then alternateSide = "Left" end
-    ForceDash:Fire({ Direction = dir, IgnoreStun = false })
-    log("DASH →", dir)
-    return true
-end
-
-local function getPingOffset()
-    if CONFIG.ManualPingOffset then return CONFIG.ManualPingOffset end
-    if not CONFIG.LatencyCompensation then return 0 end
-    local ping = LP:GetNetworkPing() or 0
-    return math.clamp(ping / 2, 0.02, 0.10)
-end
-
-RunService.Heartbeat:Connect(function()
-    if not CONFIG.Enabled then return end
-    if not opponent then return end
-    if activePunch.dashed or activePunch.cancelled then return end
-    if not canDash() then return end
-
-    if CONFIG.AntiFeint and isOppFeinting(opponent) then
-        activePunch.cancelled = true
-        log("FEINT → cancel")
-        return
-    end
-
-    local dir = getNeededDirection()
-    if not dir then return end
-
-    local char = LP.Character
-    if char and char:GetAttribute("Perfect") then
-        if doDodge(dir) then
-            activePunch.dashed = true
-            log("PERFECT ✓ via flag")
-        end
-        return
-    end
-
-    local landTime = opponent:GetAttribute("LandTime")
-    if not landTime then return end
-    local now      = Workspace:GetServerTimeNow()
-    local offset   = getPingOffset()
-    local timeLeft = landTime - now
-
-    if timeLeft <= (offset + CONFIG.Margin) and timeLeft >= -0.06 then
-        local d = dir
-        if CONFIG.StrictSide and (d == "Forward" or d == "Backward") then
-            d = computeSideDirection()
-        end
-        if doDodge(d) then
-            activePunch.dashed = true
-            log(("PERFECT ✓ LandTime (t=%.3f)"):format(timeLeft))
-        end
-    end
-end)
-
-local function onPunch(opp, forceHeavy)
-    if not CONFIG.Enabled then return end
-    if not activePunch.cancelled and not activePunch.dashed then
-        activePunch.cancelled = true
-    end
-    if CONFIG.OnlyWhenTargeted then
-        local os  = getState(opp.Name)
-        local occ = os and os:FindFirstChild("Occupied")
-        local tgt = occ and occ:FindFirstChild("LockedOn")
-        if tgt and tgt.Value ~= LP.Character then return end
-    end
-    local heavy = forceHeavy
-    if heavy == nil then heavy = opp:GetAttribute("IsHeavy") == true end
-    local startup = getStartup(opp, heavy)
-    local now = Workspace:GetServerTimeNow()
-    local token = {
-        id = opp:GetAttribute("CurrentPunchId") or 0,
-        startTime = now, hitTime = now + startup,
-        startup = startup, isHeavy = heavy,
-        cancelled = false, dashed = false,
-    }
-    activePunch = token
-    task.delay(math.max(0, startup - CONFIG.Margin), function()
-        if activePunch ~= token then return end
-        if token.cancelled or token.dashed then return end
-        if not CONFIG.Enabled then return end
-        if CONFIG.AntiFeint and isOppFeinting(opp) then
-            token.cancelled = true; return
-        end
-        local el = Workspace:GetServerTimeNow() - token.startTime
-        if CONFIG.AntiFeint and not isOppPunching(opp) and el < token.startup * 0.85 then
-            token.cancelled = true; return
-        end
-        local dir = getNeededDirection() or computeSideDirection()
-        if CONFIG.StrictSide and (dir == "Forward" or dir == "Backward") then
-            dir = computeSideDirection()
-        end
-        if doDodge(dir) then token.dashed = true end
-    end)
-end
-
-local function unbind()
-    for _, c in ipairs(conns) do c:Disconnect() end
-    table.clear(conns)
-    opponent = nil
-end
-
-local function bind(oppChar)
-    unbind()
-    if not oppChar then return end
-    opponent = oppChar
-    log("bound:", oppChar.Name)
-    local lastId = oppChar:GetAttribute("CurrentPunchId") or 0
-    table.insert(conns, oppChar:GetAttributeChangedSignal("CurrentPunchId"):Connect(function()
-        local nid = oppChar:GetAttribute("CurrentPunchId") or 0
-        if nid ~= lastId then
-            lastId = nid
-            onPunch(oppChar, nil)
-        end
-    end))
-    local os = getState(oppChar.Name)
-    local occ = os and os:FindFirstChild("Occupied")
-    local punching = occ and occ:FindFirstChild("Punching")
-    if punching then
-        local prev = punching.Value
-        table.insert(conns, punching.Changed:Connect(function(v)
-            if v and not prev then onPunch(oppChar, nil) end
-            prev = v
-        end))
-    end
-    local wp = oppChar:GetAttribute("Punching") or false
-    table.insert(conns, oppChar:GetAttributeChangedSignal("Punching"):Connect(function()
-        local n = oppChar:GetAttribute("Punching") or false
-        if n and not wp then onPunch(oppChar, nil) end
-        wp = n
-    end))
-    local wh = oppChar:GetAttribute("HeavyPunching") or false
-    table.insert(conns, oppChar:GetAttributeChangedSignal("HeavyPunching"):Connect(function()
-        local n = oppChar:GetAttribute("HeavyPunching") or false
-        if n and not wh then onPunch(oppChar, true) end
-        wh = n
-    end))
-    local wf = oppChar:GetAttribute("IsFeinting") or false
-    table.insert(conns, oppChar:GetAttributeChangedSignal("IsFeinting"):Connect(function()
-        local n = oppChar:GetAttribute("IsFeinting") or false
-        if n and not wf and CONFIG.AntiFeint then
-            activePunch.cancelled = true
-        end
-        wf = n
-    end))
-end
-
-local function watchOpponent()
-    local cd = getMyCD(); if not cd then return end
-    local oppVal = cd:FindFirstChild("Opponent"); if not oppVal then return end
-    bind(oppVal.Value)
-    table.insert(conns, oppVal.Changed:Connect(bind))
-end
-
-task.spawn(function()
-    while not getMyCD() do task.wait(0.2) end
-    watchOpponent()
-end)
-LP.CharacterAdded:Connect(function()
-    task.wait(1)
-    watchOpponent()
-end)
-
--- ==========================================================
---  PART 2: GUI CONTROL
--- ==========================================================
+local LP = Players.LocalPlayer
 
 local COLORS = {
-    Bg         = Color3.fromRGB(28, 30, 38),
-    BgHover    = Color3.fromRGB(38, 42, 52),
-    On         = Color3.fromRGB(50, 200, 100),
-    OnHover    = Color3.fromRGB(65, 220, 120),
-    Off        = Color3.fromRGB(210, 65, 70),
-    OffHover   = Color3.fromRGB(230, 85, 90),
-    Text       = Color3.fromRGB(240, 240, 245),
-    TextDim    = Color3.fromRGB(150, 155, 170),
-    Slider     = Color3.fromRGB(85, 130, 255),
-    SliderBg   = Color3.fromRGB(50, 55, 70),
-    Panel      = Color3.fromRGB(22, 24, 30),
+    On     = Color3.fromRGB(50, 200, 100),
+    Off    = Color3.fromRGB(210, 65, 70),
+    Text   = Color3.fromRGB(240, 240, 245),
+    TextDim= Color3.fromRGB(150, 155, 170),
+    Panel  = Color3.fromRGB(22, 24, 30),
+    HUD    = Color3.fromRGB(15, 17, 22),
 }
 
--- remove old
-local old = LP.PlayerGui:FindFirstChild("AutoDodgeUI")
-if old then old:Destroy() end
+-- ========== สร้าง GUI ใหม่ทั้งหมด ==========
+local gui, toggleBtn, panel, hud
+local enabledBtn, afBtn, hudBtn, marginLbl
+local hudState, hudPid, hudNeeded, hudLand, hudFired
+local refresh, setEnabled, openPanel, closePanel
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "AutoDodgeUI"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.DisplayOrder = 9999
-gui.Parent = LP:WaitForChild("PlayerGui")
+local function buildGUI()
+    -- ลบของเก่า
+    local old = LP.PlayerGui:FindFirstChild("AutoDodgeUI")
+    if old then old:Destroy() end
 
--- ============ CIRCULAR TOGGLE BUTTON (ลอย มุมขวา) ============
-local TOGGLE_SIZE = 56
-local toggleBtn = Instance.new("TextButton")
-toggleBtn.Name = "ToggleButton"
-toggleBtn.Size = UDim2.fromOffset(TOGGLE_SIZE, TOGGLE_SIZE)
-toggleBtn.Position = UDim2.new(1, -TOGGLE_SIZE - 20, 0.5, -TOGGLE_SIZE / 2)
-toggleBtn.BackgroundColor3 = CONFIG.Enabled and COLORS.On or COLORS.Off
-toggleBtn.Text = CONFIG.Enabled and "✓" or "✕"
-toggleBtn.TextColor3 = COLORS.Text
-toggleBtn.TextSize = 28
-toggleBtn.Font = Enum.Font.GothamBlack
-toggleBtn.AutoButtonColor = false
-toggleBtn.BorderSizePixel = 0
-toggleBtn.ZIndex = 10
-toggleBtn.Parent = gui
-Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(1, 0)
+    gui = Instance.new("ScreenGui")
+    gui.Name = "AutoDodgeUI"
+    gui.ResetOnSpawn = false        -- ★ ไม่หายตอน respawn
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 9999
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = LP:WaitForChild("PlayerGui")
 
-local stroke = Instance.new("UIStroke", toggleBtn)
-stroke.Color = Color3.fromRGB(0, 0, 0)
-stroke.Thickness = 2
-stroke.Transparency = 0.4
-
--- label ใต้ปุ่ม
-local toggleLabel = Instance.new("TextLabel")
-toggleLabel.Name = "Label"
-toggleLabel.Size = UDim2.new(1, 60, 0, 16)
-toggleLabel.Position = UDim2.new(0.5, -30, 1, 6)
-toggleLabel.BackgroundTransparency = 1
-toggleLabel.Text = "AUTO DODGE"
-toggleLabel.TextColor3 = COLORS.TextDim
-toggleLabel.TextSize = 10
-toggleLabel.Font = Enum.Font.GothamBold
-toggleLabel.ZIndex = 10
-toggleLabel.Parent = toggleBtn
-
--- ============ SETTINGS PANEL ============
-local panel = Instance.new("Frame")
-panel.Name = "SettingsPanel"
-panel.Size = UDim2.fromOffset(230, 0)
-panel.Position = UDim2.new(1, -TOGGLE_SIZE - 20 - 240, 0.5, -120)
-panel.BackgroundColor3 = COLORS.Panel
-panel.BorderSizePixel = 0
-panel.Visible = false
-panel.ZIndex = 9
-panel.Parent = gui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
-local panelStroke = Instance.new("UIStroke", panel)
-panelStroke.Color = Color3.fromRGB(60, 65, 85)
-panelStroke.Thickness = 1
-
-local function makeLabel(parent, text, y, color)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, -20, 0, 18)
-    l.Position = UDim2.fromOffset(10, y)
-    l.BackgroundTransparency = 1
-    l.Text = text
-    l.TextColor3 = color or COLORS.Text
-    l.TextSize = 13
-    l.Font = Enum.Font.GothamSemibold
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.ZIndex = 10
-    l.Parent = parent
-    return l
-end
-
-local function makeValueLabel(parent, y)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.fromOffset(80, 18)
-    l.Position = UDim2.new(1, -90, 0, y)
-    l.BackgroundTransparency = 1
-    l.Text = ""
-    l.TextColor3 = COLORS.Text
-    l.TextSize = 12
-    l.Font = Enum.Font.GothamBold
-    l.TextXAlignment = Enum.TextXAlignment.Right
-    l.ZIndex = 10
-    l.Parent = parent
-    return l
-end
-
--- -------- Header --------
-makeLabel(panel, "⚙ Auto Dodge Settings", 10, COLORS.Text).TextSize = 14
-
--- -------- Toggle row --------
-local rowY = 38
-makeLabel(panel, "Enabled", rowY)
-local enabledBtn = Instance.new("TextButton")
-enabledBtn.Size = UDim2.fromOffset(70, 22)
-enabledBtn.Position = UDim2.new(1, -80, 0, rowY)
-enabledBtn.BackgroundColor3 = CONFIG.Enabled and COLORS.On or COLORS.Off
-enabledBtn.Text = CONFIG.Enabled and "ON" or "OFF"
-enabledBtn.TextColor3 = COLORS.Text
-enabledBtn.TextSize = 12
-enabledBtn.Font = Enum.Font.GothamBold
-enabledBtn.AutoButtonColor = false
-enabledBtn.BorderSizePixel = 0
-enabledBtn.ZIndex = 10
-enabledBtn.Parent = panel
-Instance.new("UICorner", enabledBtn).CornerRadius = UDim.new(0, 5)
-
--- -------- Margin slider --------
-rowY = 72
-makeLabel(panel, "Margin (s)", rowY)
-local marginVal = makeValueLabel(panel, rowY)
-local function makeSlider(y, parent, min, max, initial, onChanged)
-    local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(1, -20, 0, 6)
-    bar.Position = UDim2.fromOffset(10, y + 20)
-    bar.BackgroundColor3 = COLORS.SliderBg
-    bar.BorderSizePixel = 0
-    bar.ZIndex = 10
-    bar.Parent = parent
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
-    local fill = Instance.new("Frame")
-    fill.Size = UDim2.fromScale((initial - min) / (max - min), 1)
-    fill.BackgroundColor3 = COLORS.Slider
-    fill.BorderSizePixel = 0
-    fill.ZIndex = 10
-    fill.Parent = bar
-    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
-    local knob = Instance.new("Frame")
-    knob.Size = UDim2.fromOffset(14, 14)
-    knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    knob.Position = UDim2.new(fill.Size.X.Scale, 0, 0.5, 0)
-    knob.BackgroundColor3 = Color3.new(1, 1, 1)
-    knob.BorderSizePixel = 0
-    knob.ZIndex = 11
-    knob.Parent = bar
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
-    local dragging = false
-    local function setFromX(x)
-        local abs = bar.AbsolutePosition.X
-        local w = bar.AbsoluteSize.X
-        if w <= 0 then return end
-        local p = math.clamp((x - abs) / w, 0, 1)
-        local val = min + (max - min) * p
-        fill.Size = UDim2.fromScale(p, 1)
-        knob.Position = UDim2.new(p, 0, 0.5, 0)
-        onChanged(val)
-    end
-    bar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            setFromX(input.Position.X)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            setFromX(input.Position.X)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-    return { set = function(v)
-        local p = math.clamp((v - min) / (max - min), 0, 1)
-        fill.Size = UDim2.fromScale(p, 1)
-        knob.Position = UDim2.new(p, 0, 0.5, 0)
-    end }
-end
-marginVal.Text = string.format("%.2f", CONFIG.Margin)
-makeSlider(rowY, panel, 0.0, 0.15, CONFIG.Margin, function(v)
-    CONFIG.Margin = v
-    marginVal.Text = string.format("%.2f", v)
-end)
-
--- -------- Cooldown slider --------
-rowY = 118
-makeLabel(panel, "Cooldown (s)", rowY)
-local cdVal = makeValueLabel(panel, rowY)
-cdVal.Text = string.format("%.2f", CONFIG.MinCooldown)
-makeSlider(rowY, panel, 0.02, 0.30, CONFIG.MinCooldown, function(v)
-    CONFIG.MinCooldown = v
-    cdVal.Text = string.format("%.2f", v)
-end)
-
--- -------- Direction selector --------
-rowY = 164
-makeLabel(panel, "Direction", rowY)
-local directionOptions = { "Perfect", "Left", "Right", "Away" }
-local directionIndex = 1
-local directionBtn = Instance.new("TextButton")
-directionBtn.Size = UDim2.fromOffset(100, 22)
-directionBtn.Position = UDim2.new(1, -110, 0, rowY)
-directionBtn.BackgroundColor3 = COLORS.BgHover
-directionBtn.Text = directionOptions[1]
-directionBtn.TextColor3 = COLORS.Text
-directionBtn.TextSize = 12
-directionBtn.Font = Enum.Font.GothamBold
-directionBtn.AutoButtonColor = false
-directionBtn.BorderSizePixel = 0
-directionBtn.ZIndex = 10
-directionBtn.Parent = panel
-Instance.new("UICorner", directionBtn).CornerRadius = UDim.new(0, 5)
-
-directionBtn.MouseButton1Click:Connect(function()
-    directionIndex = directionIndex % #directionOptions + 1
-    local opt = directionOptions[directionIndex]
-    directionBtn.Text = opt
-    if opt == "Perfect" then
-        CONFIG.StrictSide = true
-        CONFIG.OnlyWhenTargeted = true
-    elseif opt == "Away" then
-        CONFIG.StrictSide = true
-    end
-end)
-
--- -------- Anti-Feint row --------
-rowY = 198
-makeLabel(panel, "Anti-Feint", rowY)
-local afBtn = Instance.new("TextButton")
-afBtn.Size = UDim2.fromOffset(70, 22)
-afBtn.Position = UDim2.new(1, -80, 0, rowY)
-afBtn.BackgroundColor3 = CONFIG.AntiFeint and COLORS.On or COLORS.Off
-afBtn.Text = CONFIG.AntiFeint and "ON" or "OFF"
-afBtn.TextColor3 = COLORS.Text
-afBtn.TextSize = 12
-afBtn.Font = Enum.Font.GothamBold
-afBtn.AutoButtonColor = false
-afBtn.BorderSizePixel = 0
-afBtn.ZIndex = 10
-afBtn.Parent = panel
-Instance.new("UICorner", afBtn).CornerRadius = UDim.new(0, 5)
-
-afBtn.MouseButton1Click:Connect(function()
-    CONFIG.AntiFeint = not CONFIG.AntiFeint
-    afBtn.Text = CONFIG.AntiFeint and "ON" or "OFF"
-    afBtn.BackgroundColor3 = CONFIG.AntiFeint and COLORS.On or COLORS.Off
-end)
-
--- -------- Debug row --------
-rowY = 232
-makeLabel(panel, "Debug Log", rowY)
-local dbgBtn = Instance.new("TextButton")
-dbgBtn.Size = UDim2.fromOffset(70, 22)
-dbgBtn.Position = UDim2.new(1, -80, 0, rowY)
-dbgBtn.BackgroundColor3 = CONFIG.Debug and COLORS.On or COLORS.Off
-dbgBtn.Text = CONFIG.Debug and "ON" or "OFF"
-dbgBtn.TextColor3 = COLORS.Text
-dbgBtn.TextSize = 12
-dbgBtn.Font = Enum.Font.GothamBold
-dbgBtn.AutoButtonColor = false
-dbgBtn.BorderSizePixel = 0
-dbgBtn.ZIndex = 10
-dbgBtn.Parent = panel
-Instance.new("UICorner", dbgBtn).CornerRadius = UDim.new(0, 5)
-
-dbgBtn.MouseButton1Click:Connect(function()
-    CONFIG.Debug = not CONFIG.Debug
-    dbgBtn.Text = CONFIG.Debug and "ON" or "OFF"
-    dbgBtn.BackgroundColor3 = CONFIG.Debug and COLORS.On or COLORS.Off
-end)
-
--- resize panel
-panel.Size = UDim2.fromOffset(230, 270)
-
--- ============ BUTTON INTERACTIONS ============
-
--- toggle on click
-local function refreshToggleVisual()
+    -- ============ TOGGLE BUTTON ============
+    local SIZE = 56
+    toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "ToggleButton"
+    toggleBtn.Size = UDim2.fromOffset(SIZE, SIZE)
+    toggleBtn.Position = UDim2.new(1, -SIZE - 20, 0.5, -SIZE / 2)
     toggleBtn.BackgroundColor3 = CONFIG.Enabled and COLORS.On or COLORS.Off
     toggleBtn.Text = CONFIG.Enabled and "✓" or "✕"
-    enabledBtn.Text = CONFIG.Enabled and "ON" or "OFF"
+    toggleBtn.TextColor3 = COLORS.Text
+    toggleBtn.TextSize = 28
+    toggleBtn.Font = Enum.Font.GothamBlack
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.ZIndex = 10
+    toggleBtn.Parent = gui
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(1, 0)
+
+    local stk = Instance.new("UIStroke", toggleBtn)
+    stk.Color = Color3.new(0, 0, 0); stk.Thickness = 2; stk.Transparency = 0.4
+
+    -- Label ใต้ปุ่ม
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 60, 0, 14)
+    lbl.Position = UDim2.new(0.5, -30, 1, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "AUTO DODGE"
+    lbl.TextColor3 = COLORS.TextDim
+    lbl.TextSize = 9
+    lbl.Font = Enum.Font.GothamBold
+    lbl.ZIndex = 10
+    lbl.Parent = toggleBtn
+
+    -- ============ HUD ============
+    hud = Instance.new("Frame")
+    hud.Name = "LiveStatus"
+    hud.Size = UDim2.fromOffset(210, 94)
+    hud.Position = UDim2.new(1, -210 - 20, 0.5, SIZE / 2 + 8)
+    hud.BackgroundColor3 = COLORS.HUD
+    hud.BackgroundTransparency = 0.2
+    hud.BorderSizePixel = 0
+    hud.Visible = false
+    hud.ZIndex = 8
+    hud.Parent = gui
+    Instance.new("UICorner", hud).CornerRadius = UDim.new(0, 6)
+
+    -- ★ เก็บ reference ตรง ไม่พึ่ง GetChildren
+    local function mkLine(y, txt, ref)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, -12, 0, 14)
+        l.Position = UDim2.fromOffset(6, y)
+        l.BackgroundTransparency = 1
+        l.Text = txt
+        l.TextColor3 = COLORS.TextDim
+        l.TextSize = 10
+        l.Font = Enum.Font.Code
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.ZIndex = 9
+        l.Parent = hud
+        return l
+    end
+    hudState  = mkLine(4,  "state: OFF")
+    hudPid    = mkLine(20, "pid: 0")
+    hudNeeded = mkLine(36, "needed: nil")
+    hudLand   = mkLine(52, "land: nil")
+    hudFired  = mkLine(68, "fired: -")
+
+    -- ============ PANEL ============
+    panel = Instance.new("Frame")
+    panel.Name = "SettingsPanel"
+    panel.Size = UDim2.fromOffset(230, 210)
+    panel.Position = UDim2.new(1, -230 - SIZE - 40, 0.5, -105)
+    panel.BackgroundColor3 = COLORS.Panel
+    panel.BorderSizePixel = 0
+    panel.Visible = false
+    panel.ZIndex = 9
+    panel.Parent = gui
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+    local pstk = Instance.new("UIStroke", panel)
+    pstk.Color = Color3.fromRGB(60, 65, 85); pstk.Thickness = 1
+
+    local function mkLabel(text, y, color)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, -20, 0, 18)
+        l.Position = UDim2.fromOffset(10, y)
+        l.BackgroundTransparency = 1
+        l.Text = text; l.TextColor3 = color or COLORS.Text
+        l.TextSize = 13; l.Font = Enum.Font.GothamSemibold
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.ZIndex = 10
+        l.Parent = panel
+        return l
+    end
+    mkLabel("⚙ Auto Dodge", 8).TextSize = 14
+
+    -- Enabled toggle
+    enabledBtn = Instance.new("TextButton")
+    enabledBtn.Size = UDim2.fromOffset(60, 20)
+    enabledBtn.Position = UDim2.new(1, -70, 0, 38)
     enabledBtn.BackgroundColor3 = CONFIG.Enabled and COLORS.On or COLORS.Off
-    TweenService:Create(toggleBtn, TweenInfo.new(0.15, Enum.EasingStyle.Back),
-        { Size = UDim2.fromOffset(TOGGLE_SIZE, TOGGLE_SIZE) }):Play()
-end
+    enabledBtn.Text = CONFIG.Enabled and "ON" or "OFF"
+    enabledBtn.TextColor3 = COLORS.Text; enabledBtn.TextSize = 11
+    enabledBtn.Font = Enum.Font.GothamBold; enabledBtn.AutoButtonColor = false
+    enabledBtn.BorderSizePixel = 0; enabledBtn.ZIndex = 10; enabledBtn.Parent = panel
+    Instance.new("UICorner", enabledBtn).CornerRadius = UDim.new(0, 4)
+    mkLabel("Enabled", 38)
 
-local function setEnabled(v)
-    CONFIG.Enabled = v and true or false
-    refreshToggleVisual()
-    print("[AutoDodge]", CONFIG.Enabled and "✅ ON" or "❌ OFF")
-end
+    -- Margin
+    marginLbl = Instance.new("TextLabel")
+    marginLbl.Size = UDim2.fromOffset(60, 18)
+    marginLbl.Position = UDim2.new(1, -70, 0, 66)
+    marginLbl.BackgroundTransparency = 1
+    marginLbl.Text = string.format("%.3f", CONFIG.Margin)
+    marginLbl.TextColor3 = COLORS.Text; marginLbl.TextSize = 11
+    marginLbl.Font = Enum.Font.Code; marginLbl.TextXAlignment = Enum.TextXAlignment.Right
+    marginLbl.ZIndex = 10; marginLbl.Parent = panel
+    mkLabel("Margin (s)", 66)
 
-enabledBtn.MouseButton1Click:Connect(function()
-    setEnabled(not CONFIG.Enabled)
-end)
+    -- Anti-Feint
+    afBtn = Instance.new("TextButton")
+    afBtn.Size = UDim2.fromOffset(60, 20)
+    afBtn.Position = UDim2.new(1, -70, 0, 94)
+    afBtn.BackgroundColor3 = CONFIG.AntiFeint and COLORS.On or COLORS.Off
+    afBtn.Text = CONFIG.AntiFeint and "ON" or "OFF"
+    afBtn.TextColor3 = COLORS.Text; afBtn.TextSize = 11
+    afBtn.Font = Enum.Font.GothamBold; afBtn.AutoButtonColor = false
+    afBtn.BorderSizePixel = 0; afBtn.ZIndex = 10; afBtn.Parent = panel
+    Instance.new("UICorner", afBtn).CornerRadius = UDim.new(0, 4)
+    mkLabel("Anti-Feint", 94)
 
--- long-press = open settings | short click = toggle
-local pressStart = 0
-local pressPos   = Vector2.zero
-local moved      = false
-local longPressed = false
-local dragStart  = nil
-local dragPos0   = nil
+    -- Live HUD toggle
+    hudBtn = Instance.new("TextButton")
+    hudBtn.Size = UDim2.fromOffset(60, 20)
+    hudBtn.Position = UDim2.new(1, -70, 0, 122)
+    hudBtn.BackgroundColor3 = COLORS.On
+    hudBtn.Text = "SHOW"
+    hudBtn.TextColor3 = COLORS.Text; hudBtn.TextSize = 10
+    hudBtn.Font = Enum.Font.GothamBold; hudBtn.AutoButtonColor = false
+    hudBtn.BorderSizePixel = 0; hudBtn.ZIndex = 10; hudBtn.Parent = panel
+    Instance.new("UICorner", hudBtn).CornerRadius = UDim.new(0, 4)
+    mkLabel("Live HUD", 122)
 
-toggleBtn.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        pressStart = tick()
-        pressPos = Vector2.new(input.Position.X, input.Position.Y)
-        moved = false
-        longPressed = false
-        dragStart = pressPos
-        dragPos0 = toggleBtn.Position
-        -- start long-press timer
-        task.delay(0.55, function()
-            if not moved and not longPressed
-                and (input.UserInputType == Enum.UserInputType.MouseButton1
-                    or input.UserInputType == Enum.UserInputType.Touch) then
-                longPressed = true
-                -- toggle settings panel
+    -- Hint
+    mkLabel("F1 = toggle | hold = settings", 168, COLORS.TextDim).TextSize = 10
+
+    -- ============ INTERACTIONS ============
+    refresh = function()
+        if not toggleBtn or not toggleBtn.Parent then return end
+        toggleBtn.BackgroundColor3 = CONFIG.Enabled and COLORS.On or COLORS.Off
+        toggleBtn.Text = CONFIG.Enabled and "✓" or "✕"
+        if enabledBtn and enabledBtn.Parent then
+            enabledBtn.Text = CONFIG.Enabled and "ON" or "OFF"
+            enabledBtn.BackgroundColor3 = CONFIG.Enabled and COLORS.On or COLORS.Off
+        end
+    end
+
+    setEnabled = function(v)
+        CONFIG.Enabled = v and true or false
+        refresh()
+        print("[AutoDodge]", CONFIG.Enabled and "✅ ON" or "❌ OFF")
+    end
+
+    openPanel = function()
+        if panel then panel.Visible = true end
+    end
+    closePanel = function()
+        if panel then panel.Visible = false end
+    end
+
+    enabledBtn.MouseButton1Click:Connect(function() setEnabled(not CONFIG.Enabled) end)
+    afBtn.MouseButton1Click:Connect(function()
+        CONFIG.AntiFeint = not CONFIG.AntiFeint
+        afBtn.Text = CONFIG.AntiFeint and "ON" or "OFF"
+        afBtn.BackgroundColor3 = CONFIG.AntiFeint and COLORS.On or COLORS.Off
+    end)
+    hudBtn.MouseButton1Click:Connect(function()
+        hud.Visible = not hud.Visible
+        hudBtn.Text = hud.Visible and "HIDE" or "SHOW"
+    end)
+
+    -- ============ LONG-PRESS FIX ============
+    -- ★ State machine — ไม่มี double-toggle
+    local STATE_IDLE      = 0
+    local STATE_PRESSING  = 1
+    local STATE_DRAGGING  = 2
+    local STATE_LONGPRESS = 3
+
+    local pstate      = STATE_IDLE
+    local pressTick   = 0
+    local pressPos    = Vector2.zero
+    local dragOrigin  = UDim2.fromOffset(0, 0)
+    local longTimer   = nil
+    local longToken   = 0
+
+    local function cancelLongTimer()
+        longToken = longToken + 1
+        if longTimer then
+            task.cancel(longTimer)
+            longTimer = nil
+        end
+    end
+
+    toggleBtn.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if pstate ~= STATE_IDLE then return end
+
+        pstate     = STATE_PRESSING
+        pressTick  = tick()
+        pressPos   = Vector2.new(input.Position.X, input.Position.Y)
+        dragOrigin = toggleBtn.Position
+
+        -- ★ Token-safe long-press
+        cancelLongTimer()
+        local myToken = longToken
+        longTimer = task.delay(0.55, function()
+            longTimer = nil
+            if myToken ~= longToken then return end
+            if pstate == STATE_PRESSING then
+                pstate = STATE_LONGPRESS
                 if panel.Visible then
-                    panel.Visible = false
-                    TweenService:Create(panel, TweenInfo.new(0.2), { BackgroundTransparency = 1 }):Play()
+                    closePanel()
                 else
-                    panel.Visible = true
-                    panel.BackgroundTransparency = 0
-                    for _, d in panel:GetDescendants() do
-                        if d:IsA("TextLabel") or d:IsA("TextButton") then
-                            d.TextTransparency = 0
-                        end
-                    end
+                    openPanel()
                 end
             end
         end)
-    end
-end)
+    end)
 
-UserInputService.InputChanged:Connect(function(input)
-    if dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
+    UserInputService.InputChanged:Connect(function(input)
+        if pstate ~= STATE_PRESSING and pstate ~= STATE_DRAGGING then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
         local cur = Vector2.new(input.Position.X, input.Position.Y)
-        local delta = cur - dragStart
-        if delta.Magnitude > 8 then
-            moved = true
+        local d   = cur - pressPos
+        if d.Magnitude > 8 then
+            pstate = STATE_DRAGGING
+            cancelLongTimer()    -- ★ ยกเลิก long-press ทันทีที่เริ่มลาก
             toggleBtn.Position = UDim2.fromOffset(
-                dragPos0.X.Offset + delta.X,
-                dragPos0.Y.Offset + delta.Y
+                dragOrigin.X.Offset + d.X,
+                dragOrigin.Y.Offset + d.Y
             )
+            -- panel + hud ตามปุ่ม
             panel.Position = UDim2.fromOffset(
-                toggleBtn.Position.X.Offset - 240,
-                toggleBtn.Position.Y.Offset - 120
+                toggleBtn.Position.X.Offset - 260,
+                toggleBtn.Position.Y.Offset - 105
+            )
+            hud.Position = UDim2.fromOffset(
+                toggleBtn.Position.X.Offset - 230,
+                toggleBtn.Position.Y.Offset + 34
             )
         end
-    end
-end)
+    end)
 
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        if dragStart then
-            local dur = tick() - pressStart
-            dragStart = nil
-            if not moved and not longPressed and dur < 0.5 then
-                -- short click → toggle
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+        local prev = pstate
+        pstate = STATE_IDLE
+        cancelLongTimer()
+
+        -- ★ Logic ถูก: toggle เฉพาะคลิกสั้นจริงๆ
+        if prev == STATE_PRESSING then
+            local dur = tick() - pressTick
+            if dur < 0.5 then
                 setEnabled(not CONFIG.Enabled)
             end
         end
+        -- ถ้า STATE_LONGPRESS หรือ STATE_DRAGGING → ไม่ toggle (ถูกต้อง)
+    end)
+
+    -- ★ Hotkey F1 (fallback)
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.F1 then
+            setEnabled(not CONFIG.Enabled)
+        end
+    end)
+
+    -- ============ HUD UPDATER ============
+    task.spawn(function()
+        while gui and gui.Parent do
+            task.wait(0.05)
+            if hud and hud.Visible then
+                local char = LP.Character
+                hudState.Text = "state: " .. (CONFIG.Enabled and "ON" or "OFF")
+                local pid = 0
+                if opponent then
+                    pid = opponent:GetAttribute("CurrentPunchId") or 0
+                end
+                hudPid.Text = "pid: " .. tostring(pid)
+                local nd = "nil"
+                if char then
+                    local n = char:GetAttribute("NeededDirection")
+                    if n then nd = tostring(n) end
+                end
+                hudNeeded.Text = "needed: " .. nd
+                if opponent then
+                    local lt = opponent:GetAttribute("LandTime")
+                    if lt then
+                        hudLand.Text = string.format("land: %.3fs", lt - Workspace:GetServerTimeNow())
+                    else
+                        hudLand.Text = "land: nil"
+                    end
+                else
+                    hudLand.Text = "land: -"
+                end
+                hudFired.Text = "fired: " ..
+                    (lastFireTick and lastFireTick > 0
+                        and string.format("%.2f", tick() - lastFireTick) or "-")
+            end
+        end
+    end)
+
+    refresh()
+end
+
+-- สร้าง GUI ครั้งแรก
+buildGUI()
+
+-- ★ AUTO-RECOVER: ถ้า GUI หาย → สร้างใหม่ทันที
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not gui or not gui.Parent then
+            print("[AutoDodge] GUI หาย → สร้างใหม่")
+            buildGUI()
+        end
     end
 end)
-
--- ============ PUBLIC API ============
-_G.AutoDodge = {
-    Toggle         = function() setEnabled(not CONFIG.Enabled); return CONFIG.Enabled end,
-    Enable         = function() setEnabled(true)  end,
-    Disable        = function() setEnabled(false) end,
-    SetMargin      = function(m) CONFIG.Margin = m; marginVal.Text = string.format("%.2f", m); end,
-    SetCooldown    = function(c) CONFIG.MinCooldown = c; cdVal.Text = string.format("%.2f", c); end,
-    SetPingOffset  = function(o) CONFIG.ManualPingOffset = o end,
-    SetStrictSide  = function(v) CONFIG.StrictSide = v end,
-    SetAntiFeint   = function(v) CONFIG.AntiFeint = v; afBtn.Text = v and "ON" or "OFF"; afBtn.BackgroundColor3 = v and COLORS.On or COLORS.Off end,
-    Debug          = function(v) CONFIG.Debug = v; dbgBtn.Text = v and "ON" or "OFF"; dbgBtn.BackgroundColor3 = v and COLORS.On or COLORS.Off end,
-    Config         = CONFIG,
-    GUI            = gui,
-}
-
-print("[AutoDodge] ✅ Loaded — ปุ่มลอยมุมขวา")
-print("  • คลิกสั้น = เปิด/ปิด")
-print("  • กดค้าง 0.6s = เปิด settings")
-print("  • ลาก = ย้ายตำแหน่ง")
-print("  • console: _G.AutoDodge.Toggle()")
